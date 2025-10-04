@@ -1,0 +1,1 @@
+A separate filesystem mounted at /saves will hide this file from Python. Saves are visible via USB CPSAVES.
