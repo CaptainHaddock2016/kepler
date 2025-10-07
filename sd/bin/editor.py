@@ -1,165 +1,599 @@
 import fsio
 
-PROMPT = "editor> "
-SENTINEL = "."
+try:  # CircuitPython-compatible minimal curses wrapper
+    from adafruit_editor import dang as curses
+except ImportError:  # pragma: no cover - fallback for host testing
+    import curses  # type: ignore
 
 
-def _safe_input(prompt=""):
-    try:
-        return input(prompt)
-    except EOFError:
-        return None
+USAGE = "Usage: editor <filename>"
 
 
-def _display_help():
-    print("Simple line editor commands:")
-    print(":show          - display the current buffer")
-    print(":append        - add lines to the end of the buffer")
-    print(":insert N      - insert lines before line N (1-based)")
-    print(":set N text    - replace line N with the provided text")
-    print(":delete N      - delete line N")
-    print(":clear         - clear the buffer")
-    print(":w             - write the buffer to disk")
-    print(":wq            - write the buffer and quit")
-    print(":q             - quit without saving (prompts if unsaved changes)")
-    print(":help          - show this message again")
-    print()
-    print(f"When inserting or appending lines, finish by entering '{SENTINEL}' on a line by itself.")
+def _load_buffer(path: fsio.Path):
+    if not path.exists():
+        return [""]
+    contents = path.read("r")
+    lines = contents.splitlines()
+    return lines or [""]
 
 
-def _display_buffer(buffer):
-    if not buffer:
-        print("(buffer is empty)")
-        return
-    width = len(str(len(buffer)))
-    for idx, line in enumerate(buffer, start=1):
-        print(f"{idx:>{width}}| {line}")
-
-
-def _collect_lines():
-    print(f"Enter text. Finish with '{SENTINEL}' on its own line.")
-    lines = []
-    while True:
-        line = _safe_input()
-        if line is None:
-            print("End of input detected. Leaving line entry mode.")
-            break
-        if line == SENTINEL:
-            break
-        lines.append(line)
-    return lines
-
-
-def _write_buffer(path, buffer):
-    content = "\n".join(buffer)
+def _write_buffer(path: fsio.Path, buffer):
+    text = "\n".join(buffer)
     if buffer:
-        content += "\n"
-    path.write(content)
-    print(f"Wrote {len(buffer)} line(s) to {path.pstr()}")
+        text += "\n"
+    bytes_written = len(text.encode("utf-8"))
+    path.write(text)
+    return bytes_written
+
+
+def clamp(value, lower, upper):
+    if value < lower:
+        return lower
+    if value > upper:
+        return upper
+    return value
+
+
+class Buffer:
+    def __init__(self, lines):
+        self.lines = list(lines) or [""]
+
+    def __len__(self):
+        return len(self.lines)
+
+    def __getitem__(self, index):
+        return self.lines[index]
+
+    @property
+    def bottom(self):
+        return len(self.lines) - 1
+
+    def insert(self, cursor, string):
+        row, col = cursor.row, cursor.col
+        current = self.lines.pop(row)
+        self.lines.insert(row, current[:col] + string + current[col:])
+
+    def split(self, cursor):
+        row, col = cursor.row, cursor.col
+        current = self.lines.pop(row)
+        self.lines.insert(row, current[:col])
+        self.lines.insert(row + 1, current[col:])
+
+    def insert_line(self, row, text=""):
+        self.lines.insert(row, text)
+
+    def append_line(self, row, text=""):
+        self.lines.insert(row + 1, text)
+
+    def delete(self, cursor):
+        row, col = cursor.row, cursor.col
+        if (row, col) < (self.bottom, len(self[row])):
+            current = self.lines.pop(row)
+            if col < len(current):
+                self.lines.insert(row, current[:col] + current[col + 1 :])
+            else:
+                nextline = self.lines.pop(row)
+                self.lines.insert(row, current + nextline)
+        elif col < len(self[row]):
+            current = self.lines.pop(row)
+            self.lines.insert(row, current[:col] + current[col + 1 :])
+
+    def delete_line(self, row):
+        removed = self.lines.pop(row)
+        if not self.lines:
+            self.lines.append("")
+        return removed
+
+
+class Cursor:
+    def __init__(self, row=0, col=0, col_hint=None):
+        self.row = row
+        self._col = col
+        self._col_hint = col if col_hint is None else col_hint
+
+    @property
+    def col(self):
+        return self._col
+
+    @col.setter
+    def col(self, value):
+        self._col = value
+        self._col_hint = value
+
+    def _clamp_col(self, buffer):
+        self._col = min(self._col_hint, len(buffer[self.row]))
+
+    def up(self, buffer):
+        if self.row > 0:
+            self.row -= 1
+            self._clamp_col(buffer)
+
+    def down(self, buffer):
+        if self.row < len(buffer) - 1:
+            self.row += 1
+            self._clamp_col(buffer)
+
+    def left(self, buffer):
+        if self.col > 0:
+            self.col -= 1
+        elif self.row > 0:
+            self.row -= 1
+            self.col = len(buffer[self.row])
+
+    def right(self, buffer):
+        if self.col < len(buffer[self.row]):
+            self.col += 1
+        elif self.row < len(buffer) - 1:
+            self.row += 1
+            self.col = 0
+
+    def home(self, buffer):
+        self.col = 0
+
+    def end(self, buffer):
+        self.col = len(buffer[self.row])
+
+
+class Window:
+    def __init__(self, n_rows, n_cols, row=0, col=0):
+        self.n_rows = n_rows
+        self.n_cols = n_cols
+        self.row = row
+        self.col = col
+
+    @property
+    def bottom(self):
+        return self.row + self.n_rows - 1
+
+    def up(self, cursor):
+        if cursor.row < self.row:
+            self.row = cursor.row
+
+    def down(self, buffer, cursor):
+        if cursor.row > self.bottom:
+            max_row = max(len(buffer) - self.n_rows, 0)
+            self.row = clamp(cursor.row - self.n_rows + 1, 0, max_row)
+
+    def ensure_horizontal(self, cursor):
+        if cursor.col < self.col:
+            self.col = max(cursor.col - 5, 0)
+        elif cursor.col >= self.col + self.n_cols:
+            self.col = cursor.col - self.n_cols + 1
+
+    def translate(self, cursor):
+        return cursor.row - self.row, cursor.col - self.col
+
+
+def move_left(window, buffer, cursor):
+    cursor.left(buffer)
+    window.up(cursor)
+    window.ensure_horizontal(cursor)
+
+
+def move_right(window, buffer, cursor):
+    cursor.right(buffer)
+    window.down(buffer, cursor)
+    window.ensure_horizontal(cursor)
+
+
+def move_up(window, buffer, cursor):
+    cursor.up(buffer)
+    window.up(cursor)
+    window.ensure_horizontal(cursor)
+
+
+def move_down(window, buffer, cursor):
+    cursor.down(buffer)
+    window.down(buffer, cursor)
+    window.ensure_horizontal(cursor)
+
+
+class EditorState:
+    def __init__(self, buffer, cursor, window, filename):
+        self.buffer = buffer
+        self.cursor = cursor
+        self.window = window
+        self.filename = filename
+        self.dirty = False
+        self.mode = "NORMAL"
+        self.status = ""
+        self.pending = ""
+        self.command = ""
+        self.command_mode = False
+        self.should_quit = False
+        self.register = []
+
+    def clamp_cursor(self):
+        self.cursor.row = clamp(self.cursor.row, 0, self.buffer.bottom)
+        line_len = len(self.buffer[self.cursor.row])
+        self.cursor.col = clamp(self.cursor.col, 0, line_len)
+        self.window.up(self.cursor)
+        self.window.down(self.buffer, self.cursor)
+        self.window.ensure_horizontal(self.cursor)
+
+
+def _render_editor(stdscr, state: EditorState):
+    window = state.window
+    buffer = state.buffer
+    stdscr.erase()
+
+    for screen_row in range(window.n_rows):
+        file_row = window.row + screen_row
+        if file_row <= buffer.bottom:
+            line = buffer[file_row]
+            segment = line[window.col : window.col + window.n_cols]
+            if window.col > 0 and segment:
+                segment = "«" + segment[1:]
+            if len(line) - window.col > window.n_cols:
+                segment = segment[:-1] + "»" if segment else "»"
+        else:
+            segment = "~"
+        stdscr.addstr(screen_row, 0, segment.ljust(window.n_cols))
+
+    status_row = curses.LINES - 1
+    if state.command_mode:
+        prompt = ":" + state.command
+        line = prompt.ljust(window.n_cols)
+        stdscr.addstr(status_row, 0, line)
+        stdscr.move(status_row, len(prompt))
+        return
+
+    mode_label = "-- INSERT --" if state.mode == "INSERT" else "-- NORMAL --"
+    dirty_mark = " +" if state.dirty else ""
+    info = f"{mode_label} {state.filename}{dirty_mark}"
+    if state.status:
+        info += f" | {state.status}"
+    line = info[: window.n_cols].ljust(window.n_cols)
+    stdscr.addstr(status_row, 0, line)
+
+    row, col = window.translate(state.cursor)
+    row = clamp(row, 0, window.n_rows - 1)
+    col = clamp(col, 0, window.n_cols - 1)
+    stdscr.move(row, col)
+
+
+def _handle_command(state: EditorState, key, path: fsio.Path):
+    if key in ("\x1b",):
+        state.command_mode = False
+        state.command = ""
+        state.status = ""
+        return
+
+    if key in ("\n", "\r"):
+        command = state.command.strip()
+        force = command.endswith("!")
+        if force:
+            command = command[:-1]
+        if command in ("w", "write"):
+            bytes_written = _write_buffer(path, state.buffer.lines)
+            state.dirty = False
+            state.status = f"written {bytes_written} bytes"
+        elif command in ("q", "quit"):
+            if state.dirty and not force:
+                state.status = "No write since last change (add ! to override)"
+            else:
+                state.should_quit = True
+        elif command in ("wq", "x", "writequit", "xit"):
+            bytes_written = _write_buffer(path, state.buffer.lines)
+            state.dirty = False
+            state.status = f"written {bytes_written} bytes"
+            state.should_quit = True
+        elif command in ("q!", "quit!"):
+            state.should_quit = True
+        else:
+            state.status = f"Not an editor command: {state.command}"
+        state.command_mode = False
+        state.command = ""
+        return
+
+    if key in ("\x7f", "KEY_BACKSPACE"):
+        state.command = state.command[:-1]
+        return
+
+    if len(key) == 1 and " " <= key <= "~":
+        state.command += key
+
+
+def _handle_insert(state: EditorState, key):
+    buffer = state.buffer
+    cursor = state.cursor
+    window = state.window
+
+    if key == "\x1b":
+        if cursor.col > 0:
+            cursor.col -= 1
+        state.mode = "NORMAL"
+        state.status = ""
+        state.pending = ""
+        window.ensure_horizontal(cursor)
+        return
+
+    if key in ("\n", "\r"):
+        buffer.split(cursor)
+        cursor.row += 1
+        cursor.col = 0
+        window.down(buffer, cursor)
+        window.ensure_horizontal(cursor)
+        state.dirty = True
+        return
+
+    if key in ("\x7f", "KEY_BACKSPACE"):
+        if (cursor.row, cursor.col) > (0, 0):
+            move_left(window, buffer, cursor)
+            buffer.delete(cursor)
+            state.dirty = True
+        return
+
+    if key in ("KEY_DELETE", "\x04"):
+        buffer.delete(cursor)
+        state.dirty = True
+        state.clamp_cursor()
+        return
+
+    if key in (
+        "KEY_LEFT",
+        "KEY_RIGHT",
+        "KEY_UP",
+        "KEY_DOWN",
+        "KEY_HOME",
+        "KEY_END",
+        "KEY_PGUP",
+        "KEY_PGDN",
+    ):
+        if key == "KEY_LEFT":
+            move_left(window, buffer, cursor)
+        elif key == "KEY_RIGHT":
+            move_right(window, buffer, cursor)
+        elif key == "KEY_UP":
+            move_up(window, buffer, cursor)
+        elif key == "KEY_DOWN":
+            move_down(window, buffer, cursor)
+        elif key == "KEY_HOME":
+            cursor.home(buffer)
+            window.ensure_horizontal(cursor)
+        elif key == "KEY_END":
+            cursor.end(buffer)
+            window.ensure_horizontal(cursor)
+        elif key == "KEY_PGUP":
+            for _ in range(window.n_rows):
+                move_up(window, buffer, cursor)
+        elif key == "KEY_PGDN":
+            for _ in range(window.n_rows):
+                move_down(window, buffer, cursor)
+        return
+
+    if len(key) == 1 and " " <= key <= "~":
+        buffer.insert(cursor, key)
+        move_right(window, buffer, cursor)
+        state.dirty = True
+
+
+def _delete_line(state: EditorState):
+    removed = state.buffer.delete_line(state.cursor.row)
+    state.status = "1 line deleted"
+    state.dirty = True
+    state.register = [removed]
+    state.cursor.row = clamp(state.cursor.row, 0, state.buffer.bottom)
+    state.cursor.col = clamp(state.cursor.col, 0, len(state.buffer[state.cursor.row]))
+    state.window.down(state.buffer, state.cursor)
+    state.window.ensure_horizontal(state.cursor)
+    return removed
+
+
+def _yank_line(state: EditorState):
+    line = state.buffer[state.cursor.row]
+    state.register = [line]
+    state.status = "1 line yanked"
+
+
+def _paste_lines(state: EditorState, after=True):
+    if not state.register:
+        state.status = "Nothing in register"
+        return
+
+    row = state.cursor.row + (1 if after else 0)
+    for index, text in enumerate(state.register):
+        state.buffer.insert_line(row + index, text)
+
+    if after:
+        state.cursor.row = row + len(state.register) - 1
+    else:
+        state.cursor.row = row
+    state.cursor.row = clamp(state.cursor.row, 0, state.buffer.bottom)
+    state.cursor.col = 0
+    state.window.up(state.cursor)
+    state.window.down(state.buffer, state.cursor)
+    state.window.ensure_horizontal(state.cursor)
+    state.dirty = True
+    lines = len(state.register)
+    plural = "s" if lines != 1 else ""
+    state.status = f"{lines} line{plural} pasted"
+
+
+def _handle_normal(state: EditorState, key):
+    buffer = state.buffer
+    cursor = state.cursor
+    window = state.window
+
+    if key == "\x1b":
+        state.pending = ""
+        state.status = ""
+        return
+
+    if state.pending:
+        pending = state.pending
+        state.pending = ""
+        if pending == "d":
+            if key == "d":
+                _delete_line(state)
+                return
+            state.status = "d requires a motion"
+            return
+        if pending == "g":
+            if key == "g":
+                cursor.row = 0
+                cursor.col = 0
+                window.up(cursor)
+                window.ensure_horizontal(cursor)
+                state.status = ""
+                return
+            state.status = f"g{key} not supported"
+            return
+        if pending == "y":
+            if key == "y":
+                _yank_line(state)
+                return
+            state.status = "y requires a motion"
+            return
+
+    if key in ("h", "KEY_LEFT"):
+        move_left(window, buffer, cursor)
+        return
+    if key in ("l", "KEY_RIGHT"):
+        move_right(window, buffer, cursor)
+        return
+    if key in ("j", "KEY_DOWN"):
+        move_down(window, buffer, cursor)
+        return
+    if key in ("k", "KEY_UP"):
+        move_up(window, buffer, cursor)
+        return
+    if key in ("0", "KEY_HOME"):
+        cursor.home(buffer)
+        window.ensure_horizontal(cursor)
+        return
+    if key in ("$", "KEY_END"):
+        cursor.end(buffer)
+        window.ensure_horizontal(cursor)
+        return
+    if key == "I":
+        cursor.home(buffer)
+        window.ensure_horizontal(cursor)
+        state.mode = "INSERT"
+        state.status = ""
+        return
+    if key == "KEY_PGUP":
+        for _ in range(window.n_rows):
+            move_up(window, buffer, cursor)
+        return
+    if key == "KEY_PGDN":
+        for _ in range(window.n_rows):
+            move_down(window, buffer, cursor)
+        return
+    if key == "i":
+        state.mode = "INSERT"
+        state.status = ""
+        return
+    if key == "a":
+        move_right(window, buffer, cursor)
+        state.mode = "INSERT"
+        state.status = ""
+        return
+    if key == "A":
+        cursor.end(buffer)
+        window.ensure_horizontal(cursor)
+        state.mode = "INSERT"
+        state.status = ""
+        return
+    if key == "o":
+        cursor.end(buffer)
+        buffer.append_line(cursor.row, "")
+        cursor.row += 1
+        cursor.col = 0
+        window.down(buffer, cursor)
+        window.ensure_horizontal(cursor)
+        state.mode = "INSERT"
+        state.dirty = True
+        state.status = ""
+        return
+    if key == "O":
+        buffer.insert_line(cursor.row, "")
+        cursor.col = 0
+        window.up(cursor)
+        window.ensure_horizontal(cursor)
+        state.mode = "INSERT"
+        state.dirty = True
+        state.status = ""
+        return
+    if key == "x":
+        buffer.delete(cursor)
+        state.dirty = True
+        state.status = ""
+        state.clamp_cursor()
+        return
+    if key == "p":
+        _paste_lines(state, after=True)
+        return
+    if key == "P":
+        _paste_lines(state, after=False)
+        return
+    if key == ":":
+        state.command_mode = True
+        state.command = ""
+        state.status = ""
+        state.pending = ""
+        return
+    if key == "d":
+        state.pending = "d"
+        state.status = ""
+        return
+    if key == "g":
+        state.pending = "g"
+        state.status = ""
+        return
+    if key == "G":
+        cursor.row = buffer.bottom
+        cursor.col = 0
+        window.down(buffer, cursor)
+        window.ensure_horizontal(cursor)
+        state.status = ""
+        return
+    if key == "y":
+        state.pending = "y"
+        state.status = ""
+        return
+
+
+def _editor_loop(stdscr, path: fsio.Path, filename: str):
+    lines = _load_buffer(path)
+    buffer = Buffer(lines)
+    window = Window(max(curses.LINES - 1, 1), max(curses.COLS, 1))
+    cursor = Cursor()
+    state = EditorState(buffer=buffer, cursor=cursor, window=window, filename=filename)
+
+    while not state.should_quit:
+        state.clamp_cursor()
+        _render_editor(stdscr, state)
+        key = stdscr.getkey()
+        if state.command_mode:
+            _handle_command(state, key, path)
+        elif state.mode == "INSERT":
+            _handle_insert(state, key)
+        else:
+            _handle_normal(state, key)
+
+    return ""
 
 
 def main(argv, cwd):
     args = argv[1:]
     if not args:
-        return "Usage: editor <filename>"
+        return USAGE
 
-    path = fsio.Path(cwd).resolve(args[0])
+    target = fsio.Path(cwd).resolve(args[0])
 
-    if path.exists() and path.is_dir:
-        return f"editor: '{path.pstr()}' is a directory"
+    if target.exists() and target.is_dir:
+        return f"editor: '{target.pstr()}' is a directory"
 
-    parent = path.parent
+    parent = target.parent
     if str(parent) and not parent.exists():
         return f"editor: directory '{parent.pstr()}' does not exist"
 
-    buffer = []
-    if path.exists():
-        data = path.read("r")
-        buffer = data.splitlines()
-        print(f"Opened {path.pstr()} ({len(buffer)} line(s))")
-    else:
-        print(f"Editing new file {path.pstr()}")
+    filename = target.pstr()
 
-    _display_help()
-    if buffer:
-        _display_buffer(buffer)
-
-    dirty = False
-
-    while True:
-        command = _safe_input(PROMPT)
-        if command is None:
-            print("Input closed. Exiting editor.")
-            break
-
-        command = command.strip()
-        if not command:
-            continue
-
-        if command == ":help":
-            _display_help()
-        elif command == ":show":
-            _display_buffer(buffer)
-        elif command == ":append":
-            new_lines = _collect_lines()
-            if new_lines:
-                buffer.extend(new_lines)
-                dirty = True
-        elif command.startswith(":insert"):
-            parts = command.split()
-            if len(parts) != 2 or not parts[1].isdigit():
-                print("Usage: :insert N")
-                continue
-            line_no = int(parts[1])
-            if line_no < 1 or line_no > len(buffer) + 1:
-                print("Line number out of range")
-                continue
-            new_lines = _collect_lines()
-            if new_lines:
-                index = line_no - 1
-                buffer[index:index] = new_lines
-                dirty = True
-        elif command.startswith(":set"):
-            parts = command.split(maxsplit=2)
-            if len(parts) < 3 or not parts[1].isdigit():
-                print("Usage: :set N text")
-                continue
-            line_no = int(parts[1])
-            if line_no < 1 or line_no > len(buffer):
-                print("Line number out of range")
-                continue
-            buffer[line_no - 1] = parts[2]
-            dirty = True
-        elif command.startswith(":delete"):
-            parts = command.split()
-            if len(parts) != 2 or not parts[1].isdigit():
-                print("Usage: :delete N")
-                continue
-            line_no = int(parts[1])
-            if line_no < 1 or line_no > len(buffer):
-                print("Line number out of range")
-                continue
-            removed = buffer.pop(line_no - 1)
-            print(f"Deleted line {line_no}: {removed}")
-            dirty = True
-        elif command == ":clear":
-            buffer.clear()
-            dirty = True
-        elif command in (":w", ":write"):
-            _write_buffer(path, buffer)
-            dirty = False
-        elif command in (":wq", ":writequit"):
-            _write_buffer(path, buffer)
-            dirty = False
-            break
-        elif command == ":q":
-            if dirty:
-                confirm = _safe_input("Unsaved changes, quit anyway? (y/N): ")
-                if confirm and confirm.lower().startswith("y"):
-                    break
-            else:
-                break
-        else:
-            print("Unknown command. Type :help for instructions.")
+    try:
+        curses.wrapper(_editor_loop, target, filename)
+    except KeyboardInterrupt:
+        return ""
 
     return ""
