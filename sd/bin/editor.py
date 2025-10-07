@@ -1,3 +1,5 @@
+from dataclasses import dataclass
+
 import fsio
 
 try:  # CircuitPython-compatible minimal curses wrapper
@@ -182,19 +184,19 @@ def move_down(window, buffer, cursor):
     window.ensure_horizontal(cursor)
 
 
+@dataclass
 class EditorState:
-    def __init__(self, buffer, cursor, window, filename):
-        self.buffer = buffer
-        self.cursor = cursor
-        self.window = window
-        self.filename = filename
-        self.dirty = False
-        self.mode = "NORMAL"
-        self.status = ""
-        self.pending = ""
-        self.command = ""
-        self.command_mode = False
-        self.should_quit = False
+    buffer: Buffer
+    cursor: Cursor
+    window: Window
+    filename: str
+    dirty: bool = False
+    mode: str = "NORMAL"
+    status: str = ""
+    pending: str = ""
+    command: str = ""
+    command_mode: bool = False
+    should_quit: bool = False
 
     def clamp_cursor(self):
         self.cursor.row = clamp(self.cursor.row, 0, self.buffer.bottom)
