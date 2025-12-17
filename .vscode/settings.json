@@ -1,0 +1,9 @@
+{
+    "python.analysis.extraPaths": [
+        "lib"
+    ],
+    "python.autoComplete.extraPaths": [
+        "lib"
+    ],
+    "python.analysis.autoImportCompletions": true
+}

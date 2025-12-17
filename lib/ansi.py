@@ -1,0 +1,10 @@
+black = chr(27) + "[30m"
+red = chr(27) + "[31m"
+green = chr(27) + "[32m"
+yellow = chr(27) + "[33m"
+blue = chr(27) + "[34m"
+magenta = chr(27) + "[35m"
+cyan = chr(27) + "[36m"
+white = chr(27) + "[37m"
+reset = chr(27) + "[0m"
+bell = chr(7)
